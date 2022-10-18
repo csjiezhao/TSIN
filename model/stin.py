@@ -2,6 +2,10 @@ import torch
 import torch.nn as nn
 from lib.graph_utils import cal_adaptive_matrix
 
+"""
+Please note that here we give the basic framework of TSIN, 
+the detailed code will be released after the paper is published.
+"""
 
 class TSIN(nn.Module):
     def __init__(self, predefined_adj, args):
