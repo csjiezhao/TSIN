@@ -1,6 +1,6 @@
 ### Temporal Spatial Intertwined Network(TSIN)
 
-> This repository is the implementation of **TSIN** in Pytorch. Please note that we only provide the basic framework of **TSIN** for now, and the core code will be made public after the paper is published.
+> This repository is the implementation of **TSIN** in Pytorch.
 
 #### Data
 
