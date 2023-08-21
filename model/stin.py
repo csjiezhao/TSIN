@@ -2,10 +2,6 @@ import torch
 import torch.nn as nn
 from lib.graph_utils import cal_adaptive_matrix
 
-"""
-Please note that here we give the basic framework of TSIN, 
-the detailed code will be released after the paper is published.
-"""
 
 class TSIN(nn.Module):
     def __init__(self, predefined_adj, args):
@@ -95,3 +91,184 @@ class TSIN(nn.Module):
         ride_x = torch.matmul(ride_x, self.ride_output_layer).unsqueeze(1)
 
         return taxi_x, ride_x
+
+class STBlock(nn.Module):
+    def __init__(self, in_dim, tem_dim, spa_dim, Kt, dilation, cur_len, spatial_first, tem_interact, spa_interact):
+        super(STBlock, self).__init__()
+        self.spatial_first = spatial_first
+        if self.spatial_first:
+            self.co_spa_conv = CoSpatialConv(interact=spa_interact, seq_len=cur_len,
+                                             s_in_dim=in_dim, s_out_dim=spa_dim)
+            self.co_tem_conv = CoTemporalConv(interact=tem_interact, t_in_dim=spa_dim,
+                                              t_out_dim=tem_dim, Kt=Kt, dilation=dilation)
+            self.taxi_align_conv = ResAlign(in_dim, tem_dim)
+            self.ride_align_conv = ResAlign(in_dim, tem_dim)
+            self.taxi_batch_norm = nn.BatchNorm2d(tem_dim)
+            self.ride_batch_norm = nn.BatchNorm2d(tem_dim)
+        else:
+            self.co_tem_conv = CoTemporalConv(interact=tem_interact, t_in_dim=in_dim,
+                                              t_out_dim=tem_dim, Kt=Kt, dilation=dilation)
+            self.co_spa_conv = CoSpatialConv(interact=spa_interact, seq_len=cur_len - (Kt - 1) * dilation,
+                                             s_in_dim=tem_dim, s_out_dim=spa_dim)
+            self.taxi_align_conv = ResAlign(in_dim, spa_dim)
+            self.ride_align_conv = ResAlign(in_dim, spa_dim)
+            self.taxi_batch_norm = nn.BatchNorm2d(spa_dim)
+            self.ride_batch_norm = nn.BatchNorm2d(spa_dim)
+
+        self.align_len = cur_len - (Kt - 1) * dilation
+
+    def forward(self, taxi_x, t2t_mat, r2t_mat, ride_x, r2r_mat, t2r_mat):
+        """
+        :param taxi_x: (B, in_dim, T, N)
+        :param t2t_mat: (N, N) taxi to taxi
+        :param r2t_mat: (N, N) ride to taxi
+        :param ride_x: (B, in_dim, T, N)
+        :param r2r_mat: (N, N) ride to ride
+        :param t2r_mat: (N, N) taxi to ride
+        :return:
+        """
+        taxi_shortcut = self.taxi_align_conv(taxi_x[:, :, -self.align_len:, :])
+        ride_shortcut = self.ride_align_conv(ride_x[:, :, -self.align_len:, :])
+        if self.spatial_first:
+            taxi_x, ride_x = self.co_spa_conv(taxi_x, t2t_mat, r2t_mat, ride_x, r2r_mat, t2r_mat)
+            taxi_x, ride_x = self.co_tem_conv(taxi_x, ride_x)
+        else:
+            taxi_x, ride_x = self.co_tem_conv(taxi_x, ride_x)
+            taxi_x, ride_x = self.co_spa_conv(taxi_x, t2t_mat, r2t_mat, ride_x, r2r_mat, t2r_mat)
+        taxi_x = self.taxi_batch_norm(taxi_shortcut + taxi_x)
+        ride_x = self.ride_batch_norm(ride_shortcut + ride_x)
+        return taxi_x, ride_x
+
+
+class CoSpatialConv(nn.Module):
+    def __init__(self, interact, seq_len, s_in_dim, s_out_dim):
+        super(CoSpatialConv, self).__init__()
+        self.taxi_spa_conv = HetGraphConv(interact, seq_len, s_in_dim, s_out_dim)
+        self.ride_spa_conv = HetGraphConv(interact, seq_len, s_in_dim, s_out_dim)
+
+    def forward(self, taxi_x, t2t_mat, r2t_mat, ride_x, r2r_mat, t2r_mat):
+        """
+        :param taxi_x: (B, in_dim, T, N)
+        :param t2t_mat: (N, N) taxi to taxi
+        :param r2t_mat: (N, N) ride to taxi
+        :param ride_x: (B, in_dim, T, N)
+        :param r2r_mat: (N, N) ride to ride
+        :param t2r_mat: (N, N) taxi to ride
+        :return:
+        """
+        taxi_out = self.taxi_spa_conv(hom_x=taxi_x, hom_mat=t2t_mat, het_x=ride_x, het_mat=r2t_mat)
+        ride_out = self.ride_spa_conv(hom_x=ride_x, hom_mat=r2r_mat, het_x=taxi_x, het_mat=t2r_mat)
+        return taxi_out, ride_out
+
+
+class HetGraphConv(nn.Module):
+    def __init__(self, interact, cur_len, s_in_dim, s_out_dim,):
+        super(HetGraphConv, self).__init__()
+        self.cur_len = cur_len
+        self.s_in_dim = s_in_dim
+        self.s_out_dim = s_out_dim
+        self.interact = interact
+
+        if interact:
+            self.W = nn.Conv2d(in_channels=3 * self.s_in_dim, out_channels=2 * self.s_out_dim, kernel_size=(1, 1),
+                               padding=(0, 0), stride=(1, 1), bias=True)
+        else:
+            self.W = nn.Conv2d(in_channels=2 * self.s_in_dim, out_channels=2 * self.s_out_dim, kernel_size=(1, 1),
+                               padding=(0, 0), stride=(1, 1), bias=True)
+
+        self.drop_out = nn.Dropout(p=0.3)
+
+    def forward(self, hom_x, hom_mat, het_x, het_mat):
+        """
+        :param hom_x: (batch, in_dim, cur_len, num_nodes)
+        :param hom_mat: (num_nodes, num_nodes)
+        :param het_x: (batch, in_dim, cur_len, num_nodes)
+        :param het_mat: (num_nodes, num_nodes)
+        :return: (batch, out_dim, cur_len, num_nodes)
+        """
+
+        hom_conv = torch.einsum('bcln, nm -> bclm', (hom_x, hom_mat))
+
+        if self.interact:
+            het_conv = torch.einsum('bcln, nm -> bclm', (het_x, het_mat))
+            out = torch.cat([hom_x, hom_conv, het_conv], dim=1)  # (batch_size, 3*in_dim, seq_len, num_nodes)
+        else:
+            out = torch.cat([hom_x, hom_conv], dim=1)
+
+        out = self.W(out)  # (batch_size, 2 * out_dim, seq_len, num_nodes)
+        out_p, out_q = torch.chunk(out, chunks=2, dim=1)
+        out = out_p * torch.sigmoid(out_q)  # (batch_size, out_dim, seq_len, num_nodes)
+        out = self.drop_out(out)
+        return out
+
+
+class CoTemporalConv(nn.Module):
+    def __init__(self, interact, t_in_dim, t_out_dim, Kt, dilation, Ks=1):
+        super(CoTemporalConv, self).__init__()
+        self.interact = interact
+        self.Kt = Kt
+        self.dilation = dilation
+
+        self.taxi_conv2d = nn.Conv2d(t_in_dim, 2 * t_out_dim, kernel_size=(Kt, Ks),
+                                     padding=((Kt - 1) * dilation, 0), dilation=dilation)
+
+        self.ride_conv2d = nn.Conv2d(t_in_dim, 2 * t_out_dim, kernel_size=(Kt, Ks),
+                                     padding=((Kt - 1) * dilation, 0), dilation=dilation)
+        if self.interact:
+            self.taxi_het_conv2d = nn.Conv2d(t_in_dim, 2 * t_out_dim, kernel_size=(Kt, Ks))
+            self.ride_het_conv2d = nn.Conv2d(t_in_dim, 2 * t_out_dim, kernel_size=(Kt, Ks))
+
+    def forward(self, taxi_x, ride_x):
+        """
+        :param taxi_x: (batch, t_in_dim, seq_len, num_nodes)
+        :param ride_x: (batch, t_in_dim, seq_len, num_nodes)
+        """
+        if self.interact:
+            taxi_het_x = self.taxi_het_conv2d(ride_x[:, :, -self.Kt:, :])
+            ride_het_x = self.ride_het_conv2d(taxi_x[:, :, -self.Kt:, :])
+
+            # Self Gated
+            taxi_het_x = torch.relu(taxi_het_x)
+            ride_het_x = torch.relu(ride_het_x)
+
+            taxi_x = self.taxi_conv2d(taxi_x)
+            taxi_x = taxi_x[:, :, (self.Kt - 1) * self.dilation:-(self.Kt - 1) * self.dilation, :]
+            taxi_x[:, :, -1:, :] += taxi_het_x
+
+            ride_x = self.ride_conv2d(ride_x)
+            ride_x = ride_x[:, :, (self.Kt - 1) * self.dilation:-(self.Kt - 1) * self.dilation, :]
+            ride_x[:, :, -1:, :] += ride_het_x
+        else:
+            taxi_x = self.taxi_conv2d(taxi_x)
+            taxi_x = taxi_x[:, :, (self.Kt - 1) * self.dilation:-(self.Kt - 1) * self.dilation, :]
+
+            ride_x = self.ride_conv2d(ride_x)
+            ride_x = ride_x[:, :, (self.Kt - 1) * self.dilation:-(self.Kt - 1) * self.dilation, :]
+
+        taxi_x_p, taxi_x_q = torch.chunk(taxi_x, 2, dim=1)
+        ride_x_p, ride_x_q = torch.chunk(ride_x, 2, dim=1)
+        return taxi_x_p * torch.sigmoid(taxi_x_q), ride_x_p * torch.sigmoid(ride_x_q)
+
+
+class ResAlign(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super(ResAlign, self).__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.reduce_conv = nn.Conv2d(in_dim, out_dim, kernel_size=(1, 1))
+
+    def forward(self, x):
+        """
+        Align the feature dimension
+        :param x: (batch, in_dim, seq_len-(Kt-1), num_nodes)
+        :return: (batch, out_dim, seq_len-(Kt-1), num_nodes)
+        """
+        if self.in_dim > self.out_dim:
+            x = self.reduce_conv(x)
+        elif self.in_dim < self.out_dim:
+            batch, _, seq_len, num_nodes = x.shape
+            x = torch.cat([x, torch.zeros([batch, self.out_dim - self.in_dim, seq_len, num_nodes],
+                                          device=x.device)], dim=1)
+        else:
+            x = x
+        return x
