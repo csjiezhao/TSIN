@@ -1,8 +1,8 @@
 ### Temporal Spatial Intertwined Network(TSIN)
 
-> This repository is the implementation of **TSIN** in Pytorch.
+> This repository is the official implementation of **TSIN**("Coupling Makes Better: An Intertwined Neural Network for Taxi and Ridesourcing Demand Co-Prediction") with Pytorch.
 
-#### Data
+#### Raw Data
 
 - NYC-Taxi & FHV: https://www1.nyc.gov/site/tlc/about/tlc-trip-record-data.page
 - CHI-Taxi: https://data.cityofchicago.org/Transportation/Transportation-Network-Providers-Trips-2018/rpfj-eb3a
